@@ -7,14 +7,15 @@ import { Permission } from '../lib/permissions';
 import logger from '../logger';
 import { getSettings } from '../lib/settings';
 import { UserType } from '../constants/user';
+import { MediaServerTypes } from '../constants/server';
 
 const authRoutes = Router();
 
 authRoutes.get('/me', isAuthenticated(), async (req, res) => {
   const userRepository = getRepository(User);
   if (!req.user) {
-    return res.status(500).json({
-      status: 500,
+    return res.status(403).json({
+      status: 403,
       error:
         'Requested user endpoint without valid authenticated user in session',
     });
@@ -26,123 +27,135 @@ authRoutes.get('/me', isAuthenticated(), async (req, res) => {
   return res.status(200).json(user.filter());
 });
 
-authRoutes.post('/login', async (req, res, next) => {
+authRoutes.post('/login/provider', async (req, res, next) => {
   const settings = getSettings();
   const userRepository = getRepository(User);
-  const body = req.body as { authToken?: string };
+  const body = req.body as {
+    authToken?: string;
+    username?: string;
+    email?: string;
+    password?: string;
+    provider: MediaServerTypes;
+  };
 
-  if (!body.authToken) {
-    return res.status(500).json({ error: 'You must provide an auth token' });
+  if (!body.provider) {
+    return res.status(400).json({ error: 'No provider' });
   }
-  try {
-    // First we need to use this auth token to get the users email from plex tv
-    const plextv = new PlexTvAPI(body.authToken);
-    const account = await plextv.getUser();
 
-    // Next let's see if the user already exists
-    let user = await userRepository.findOne({
-      where: { plexId: account.id },
-    });
+  if (body.provider == MediaServerTypes.PLEX) {
+    if (!body.authToken) {
+      return res.status(400).json({ error: 'No auth token' });
+    }
+    try {
+      // First we need to use this auth token to get the users email from plex tv
+      const plextv = new PlexTvAPI(body.authToken);
+      const account = await plextv.getUser();
 
-    if (user) {
-      // Let's check if their plex token is up to date
-      if (user.plexToken !== body.authToken) {
-        user.plexToken = body.authToken;
-      }
+      // Next let's see if the user already exists
+      let user = await userRepository.findOne({
+        where: { plexId: account.id },
+      });
 
-      // Update the users avatar with their plex thumbnail (incase it changed)
-      user.avatar = account.thumb;
-      user.email = account.email;
-      user.plexUsername = account.username;
+      if (user) {
+        // Let's check if their plex token is up to date
+        if (user.plexToken !== body.authToken) {
+          user.plexToken = body.authToken;
+        }
 
-      if (user.username === account.username) {
-        user.username = '';
-      }
-      await userRepository.save(user);
-    } else {
-      // Here we check if it's the first user. If it is, we create the user with no check
-      // and give them admin permissions
-      const totalUsers = await userRepository.count();
+        // Update the users avatar with their plex thumbnail (incase it changed)
+        user.avatar = account.thumb;
+        user.email = account.email;
+        user.plexUsername = account.username;
 
-      if (totalUsers === 0) {
-        user = new User({
-          email: account.email,
-          plexUsername: account.username,
-          plexId: account.id,
-          plexToken: account.authToken,
-          permissions: Permission.ADMIN,
-          avatar: account.thumb,
-          userType: UserType.PLEX,
-        });
+        if (user.username === account.username) {
+          user.username = '';
+        }
         await userRepository.save(user);
-      }
+      } else {
+        // Here we check if it's the first user. If it is, we create the user with no check
+        // and give them admin permissions
+        const totalUsers = await userRepository.count();
 
-      // Double check that we didn't create the first admin user before running this
-      if (!user) {
-        // If we get to this point, the user does not already exist so we need to create the
-        // user _assuming_ they have access to the plex server
-        const mainUser = await userRepository.findOneOrFail({
-          select: ['id', 'plexToken'],
-          order: { id: 'ASC' },
-        });
-        const mainPlexTv = new PlexTvAPI(mainUser.plexToken ?? '');
-
-        if (await mainPlexTv.checkUserAccess(account)) {
+        if (totalUsers === 0) {
           user = new User({
             email: account.email,
             plexUsername: account.username,
             plexId: account.id,
             plexToken: account.authToken,
-            permissions: settings.main.defaultPermissions,
+            permissions: Permission.ADMIN,
             avatar: account.thumb,
             userType: UserType.PLEX,
           });
           await userRepository.save(user);
-        } else {
-          logger.info(
-            'Failed login attempt from user without access to plex server',
-            {
-              label: 'Auth',
-              account: {
-                ...account,
-                authentication_token: '__REDACTED__',
-                authToken: '__REDACTED__',
-              },
-            }
-          );
-          return next({
-            status: 403,
-            message: 'You do not have access to this Plex server',
+        }
+
+        // Double check that we didn't create the first admin user before running this
+        if (!user) {
+          // If we get to this point, the user does not already exist so we need to create the
+          // user _assuming_ they have access to the plex server
+          const mainUser = await userRepository.findOneOrFail({
+            select: ['id', 'plexToken'],
+            order: { id: 'ASC' },
           });
+          const mainPlexTv = new PlexTvAPI(mainUser.plexToken ?? '');
+
+          if (await mainPlexTv.checkUserAccess(account)) {
+            user = new User({
+              email: account.email,
+              plexUsername: account.username,
+              plexId: account.id,
+              plexToken: account.authToken,
+              permissions: settings.main.defaultPermissions,
+              avatar: account.thumb,
+              userType: UserType.PLEX,
+            });
+            await userRepository.save(user);
+          } else {
+            logger.info(
+              'Failed login attempt from user without access to plex server',
+              {
+                label: 'Auth',
+                account: {
+                  ...account,
+                  authentication_token: '__REDACTED__',
+                  authToken: '__REDACTED__',
+                },
+              }
+            );
+            return next({
+              status: 403,
+              message: 'You do not have access to this Plex server',
+            });
+          }
         }
       }
-    }
 
-    // Set logged in session
-    if (req.session) {
-      req.session.userId = user.id;
-    }
+      // Set logged in session
+      if (req.session) {
+        req.session.userId = user.id;
+      }
 
-    return res.status(200).json(user?.filter() ?? {});
-  } catch (e) {
-    logger.error(e.message, { label: 'Auth' });
-    return next({
-      status: 500,
-      message: 'Something went wrong. Is your auth token valid?',
-    });
+      return res.status(200).json(user?.filter() ?? {});
+    } catch (e) {
+      logger.error(e.message, { label: 'Auth' });
+      return next({
+        status: 500,
+        message: 'Something went wrong. Is your auth token valid?',
+      });
+    }
   }
 });
 
-authRoutes.post('/local', async (req, res, next) => {
+authRoutes.post('/login/local', async (req, res, next) => {
   const settings = getSettings();
   const userRepository = getRepository(User);
   const body = req.body as { email?: string; password?: string };
 
   if (!settings.main.localLogin) {
-    return res.status(500).json({ error: 'Local user login is disabled' });
+    return res.status(400).json({ error: 'Local user login is disabled' });
   } else if (!body.email || !body.password) {
     return res
-      .status(500)
+      .status(400)
       .json({ error: 'You must provide an email and a password' });
   }
   try {
@@ -240,7 +253,7 @@ authRoutes.post('/reset-password/:guid', async (req, res, next) => {
         label: 'User Management',
         context: { ip: req.ip, guid: req.params.guid },
       });
-      return next({ status: 500, message: message });
+      return next({ status: 400, message: message });
     }
 
     const user = await userRepository.findOne({

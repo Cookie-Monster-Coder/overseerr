@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { getSettings, Library, MainSettings } from '../../lib/settings';
 import { getRepository } from 'typeorm';
 import { User } from '../../entity/User';
-import PlexAPI from '../../api/plexapi';
+import PlexAPI, { PlexLibrary } from '../../api/plexapi';
 import PlexTvAPI from '../../api/plextv';
 import { jobPlexFullSync } from '../../job/plexsync';
 import { scheduledJobs } from '../../job/schedule';
@@ -17,6 +17,7 @@ import notificationRoutes from './notifications';
 import sonarrRoutes from './sonarr';
 import radarrRoutes from './radarr';
 import cacheManager, { AvailableCacheIds } from '../../lib/cache';
+import { MediaServerTypes } from '../../constants/server';
 
 const settingsRoutes = Router();
 
@@ -39,7 +40,7 @@ settingsRoutes.get('/main', (req, res, next) => {
   const settings = getSettings();
 
   if (!req.user) {
-    return next({ status: 500, message: 'User missing from request' });
+    return next({ status: 401, message: 'Unauthorized' });
   }
 
   res.status(200).json(filteredMainSettings(req.user, settings.main));
@@ -49,6 +50,25 @@ settingsRoutes.post('/main', (req, res) => {
   const settings = getSettings();
 
   settings.main = merge(settings.main, req.body);
+  //Reset settings.mediaServer ONLY if the user is changing the parameter.
+  if (req.body.mediaServer) {
+    if (
+      settings.main.mediaServerType === MediaServerTypes.NONE ||
+      settings.main.mediaServerType === MediaServerTypes.NOT_CONFIGURED
+    ) {
+      settings.mediaServer = {};
+    } else if (settings.main.mediaServerType === MediaServerTypes.PLEX) {
+      settings.mediaServer = {
+        name: '',
+        machineId: '',
+        ip: '',
+        port: 32400,
+        useSsl: false,
+        libraries: [],
+      };
+    }
+  }
+
   settings.save();
 
   return res.status(200).json(settings.main);
@@ -60,47 +80,135 @@ settingsRoutes.post('/main/regenerate', (req, res, next) => {
   const main = settings.regenerateApiKey();
 
   if (!req.user) {
-    return next({ status: 500, message: 'User missing from request' });
+    return next({ status: 401, message: 'Unauthorized' });
   }
 
   return res.status(200).json(filteredMainSettings(req.user, main));
 });
 
-settingsRoutes.get('/plex', (_req, res) => {
+settingsRoutes.get('/mediaServer', (_req, res) => {
   const settings = getSettings();
 
-  res.status(200).json(settings.plex);
+  res.status(200).json(settings.mediaServer);
 });
 
-settingsRoutes.post('/plex', async (req, res, next) => {
+settingsRoutes.post('/mediaServer', async (req, res, next) => {
   const userRepository = getRepository(User);
   const settings = getSettings();
-  try {
-    const admin = await userRepository.findOneOrFail({
-      select: ['id', 'plexToken'],
-      order: { id: 'ASC' },
-    });
 
-    Object.assign(settings.plex, req.body);
+  if (settings.main.mediaServerType == MediaServerTypes.PLEX) {
+    try {
+      const admin = await userRepository.findOneOrFail({
+        select: ['id', 'plexToken'],
+        order: { id: 'ASC' },
+      });
 
-    const plexClient = new PlexAPI({ plexToken: admin.plexToken });
+      Object.assign(settings.mediaServer, req.body);
 
-    const result = await plexClient.getStatus();
+      const plexClient = new PlexAPI({ plexToken: admin.plexToken });
 
-    if (result?.MediaContainer?.machineIdentifier) {
-      settings.plex.machineId = result.MediaContainer.machineIdentifier;
-      settings.plex.name = result.MediaContainer.friendlyName;
+      const result = await plexClient.getStatus();
 
-      settings.save();
+      if (result?.MediaContainer?.machineIdentifier) {
+        settings.mediaServer.machineId =
+          result.MediaContainer.machineIdentifier;
+        settings.mediaServer.name = result.MediaContainer.friendlyName;
+      }
+    } catch (e) {
+      return next({
+        status: 500,
+        message: `Failed to connect to set media server settings: ${e.message}`,
+      });
     }
-  } catch (e) {
-    return next({
-      status: 500,
-      message: `Failed to connect to Plex: ${e.message}`,
-    });
   }
 
-  return res.status(200).json(settings.plex);
+  return res.status(200).json(settings.mediaServer);
+});
+
+settingsRoutes.get('/mediaServer/library', async (req, res) => {
+  const settings = getSettings();
+
+  if (req.query.sync) {
+    let libraries: PlexLibrary[] = []; //All future media server types will need to implement an identical type!
+    if (settings.main.mediaServerType === MediaServerTypes.PLEX) {
+      const userRepository = getRepository(User);
+      const admin = await userRepository.findOneOrFail({
+        select: ['id', 'plexToken'],
+        order: { id: 'ASC' },
+      });
+      const plexapi = new PlexAPI({ plexToken: admin.plexToken });
+
+      libraries = await plexapi.getLibraries();
+    }
+
+    const newLibraries: Library[] = libraries
+      // Remove libraries that are not movie or show
+      .filter((library) => library.type === 'movie' || library.type === 'show')
+      // Remove libraries that do not have a metadata agent set (usually personal video libraries)
+      .filter((library) => library.agent !== 'com.plexapp.agents.none')
+      .map((library) => {
+        const existing = settings.mediaServer.libraries.find(
+          (l) => l.id === library.key && l.name === library.title
+        );
+
+        return {
+          id: library.key,
+          name: library.title,
+          enabled: existing?.enabled ?? false,
+        };
+      });
+
+    settings.mediaServer.libraries = newLibraries;
+  }
+
+  const enabledLibraries = req.query.enable
+    ? (req.query.enable as string).split(',')
+    : [];
+  settings.mediaServer.libraries = settings.mediaServer.libraries.map(
+    (library) => ({
+      ...library,
+      enabled: enabledLibraries.includes(library.id),
+    })
+  );
+  settings.save();
+  return res.status(200).json(settings.mediaServer.libraries);
+});
+
+settingsRoutes.get('/mediaServer/sync', (_req, res) => {
+  const currentMediaServerType = getSettings().main.mediaServerType;
+  if (currentMediaServerType === MediaServerTypes.PLEX) {
+    return res.status(200).json(jobPlexFullSync.status());
+  } else {
+    const jobResponse = {
+      running: false,
+      progress: 0,
+      total: 0,
+      currentLibrary: undefined,
+      libraries: [],
+    };
+    return res.status(200).json(jobResponse);
+  }
+});
+
+settingsRoutes.post('/mediaServer/sync', (req, res) => {
+  const currentMediaServerType = getSettings().main.mediaServerType;
+  if (currentMediaServerType === MediaServerTypes.PLEX) {
+    if (req.body.cancel) {
+      jobPlexFullSync.cancel();
+    } else if (req.body.start) {
+      jobPlexFullSync.run();
+    }
+    return res.status(200).json(jobPlexFullSync.status());
+  } else {
+    const jobResponse = {
+      running: false,
+      progress: 0,
+      total: 0,
+      currentLibrary: undefined,
+      libraries: [],
+    };
+    return res.status(200).json(jobResponse);
+  }
 });
 
 settingsRoutes.get('/plex/devices/servers', async (req, res, next) => {
@@ -128,10 +236,12 @@ settingsRoutes.get('/plex/devices/servers', async (req, res, next) => {
                 | { status: number; message: string }
                 | undefined = undefined;
               const plexDeviceSettings = {
-                ...settings.plex,
+                ...settings.mediaServer,
                 ip: connection.host,
                 port: connection.port,
                 useSsl: connection.protocol === 'https' ? true : false,
+                name: settings.mediaServer.name,
+                libraries: settings.mediaServer.libraries,
               };
               const plexClient = new PlexAPI({
                 plexToken: admin.plexToken,
@@ -164,63 +274,6 @@ settingsRoutes.get('/plex/devices/servers', async (req, res, next) => {
       message: `Failed to connect to Plex: ${e.message}`,
     });
   }
-});
-
-settingsRoutes.get('/plex/library', async (req, res) => {
-  const settings = getSettings();
-
-  if (req.query.sync) {
-    const userRepository = getRepository(User);
-    const admin = await userRepository.findOneOrFail({
-      select: ['id', 'plexToken'],
-      order: { id: 'ASC' },
-    });
-    const plexapi = new PlexAPI({ plexToken: admin.plexToken });
-
-    const libraries = await plexapi.getLibraries();
-
-    const newLibraries: Library[] = libraries
-      // Remove libraries that are not movie or show
-      .filter((library) => library.type === 'movie' || library.type === 'show')
-      // Remove libraries that do not have a metadata agent set (usually personal video libraries)
-      .filter((library) => library.agent !== 'com.plexapp.agents.none')
-      .map((library) => {
-        const existing = settings.plex.libraries.find(
-          (l) => l.id === library.key && l.name === library.title
-        );
-
-        return {
-          id: library.key,
-          name: library.title,
-          enabled: existing?.enabled ?? false,
-        };
-      });
-
-    settings.plex.libraries = newLibraries;
-  }
-
-  const enabledLibraries = req.query.enable
-    ? (req.query.enable as string).split(',')
-    : [];
-  settings.plex.libraries = settings.plex.libraries.map((library) => ({
-    ...library,
-    enabled: enabledLibraries.includes(library.id),
-  }));
-  settings.save();
-  return res.status(200).json(settings.plex.libraries);
-});
-
-settingsRoutes.get('/plex/sync', (_req, res) => {
-  return res.status(200).json(jobPlexFullSync.status());
-});
-
-settingsRoutes.post('/plex/sync', (req, res) => {
-  if (req.body.cancel) {
-    jobPlexFullSync.cancel();
-  } else if (req.body.start) {
-    jobPlexFullSync.run();
-  }
-  return res.status(200).json(jobPlexFullSync.status());
 });
 
 settingsRoutes.get('/jobs', (_req, res) => {

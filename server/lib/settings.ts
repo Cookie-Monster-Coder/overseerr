@@ -3,6 +3,7 @@ import path from 'path';
 import { merge } from 'lodash';
 import { v4 as uuidv4 } from 'uuid';
 import { Permission } from './permissions';
+import { MediaServerTypes } from '../constants/server';
 
 export interface Library {
   id: string;
@@ -59,6 +60,7 @@ export interface MainSettings {
   hideAvailable: boolean;
   localLogin: boolean;
   trustProxy: boolean;
+  mediaServerType: MediaServerTypes;
 }
 
 interface PublicSettings {
@@ -71,6 +73,7 @@ interface FullPublicSettings extends PublicSettings {
   localLogin: boolean;
   movie4kEnabled: boolean;
   series4kEnabled: boolean;
+  mediaServerType: MediaServerTypes;
 }
 
 export interface NotificationAgentConfig {
@@ -146,7 +149,7 @@ interface NotificationSettings {
 interface AllSettings {
   clientId: string;
   main: MainSettings;
-  plex: PlexSettings;
+  mediaServer: PlexSettings | Record<string, never>; //union types here for future mediaServer types, last type is for NotConfigured.
   radarr: RadarrSettings[];
   sonarr: SonarrSettings[];
   public: PublicSettings;
@@ -172,14 +175,9 @@ class Settings {
         hideAvailable: false,
         localLogin: true,
         trustProxy: false,
+        mediaServerType: MediaServerTypes.NOT_CONFIGURED,
       },
-      plex: {
-        name: '',
-        ip: '127.0.0.1',
-        port: 32400,
-        useSsl: false,
-        libraries: [],
-      },
+      mediaServer: {},
       radarr: [],
       sonarr: [],
       public: {
@@ -264,12 +262,12 @@ class Settings {
     this.data.main = data;
   }
 
-  get plex(): PlexSettings {
-    return this.data.plex;
+  get mediaServer(): PlexSettings | Record<string, never> {
+    return this.data.mediaServer;
   }
 
-  set plex(data: PlexSettings) {
-    this.data.plex = data;
+  set mediaServer(data: PlexSettings | Record<string, never>) {
+    this.data.mediaServer = data;
   }
 
   get radarr(): RadarrSettings[] {
@@ -308,6 +306,7 @@ class Settings {
       series4kEnabled: this.data.sonarr.some(
         (sonarr) => sonarr.is4k && sonarr.isDefault
       ),
+      mediaServerType: this.data.main.mediaServerType,
     };
   }
 
